@@ -1,5 +1,6 @@
+import json
 import logging
-from anthropic import Anthropic
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -33,21 +34,29 @@ class ClaudeClient:
         import os
         from dotenv import load_dotenv
         load_dotenv()
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        self.client = Anthropic(api_key=api_key)
-        self.model = os.getenv("CLAUDE_MODEL", "claude-opus-4-7")
+        self.api_key = os.getenv("DEEPSEEK_API_KEY", "")
+        self.model = os.getenv("AI_MODEL", "deepseek-chat")
+        self.base_url = os.getenv("AI_BASE_URL", "https://api.deepseek.com/v1/chat/completions")
 
     def chat(self, message):
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=2000,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": message}],
-            )
-            reply = response.content[0].text
-            logger.info(f"Claude 回复: {reply[:100]}...")
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": self.model,
+                "max_tokens": 2000,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": message},
+                ],
+            }
+            resp = requests.post(self.base_url, headers=headers, json=payload, timeout=30)
+            data = resp.json()
+            reply = data["choices"][0]["message"]["content"]
+            logger.info(f"AI 回复: {reply[:100]}...")
             return reply
         except Exception as e:
-            logger.error(f"Claude API 调用失败: {e}")
+            logger.error(f"AI API 调用失败: {e}")
             return f"抱歉，AI 服务出错了：{e}"
