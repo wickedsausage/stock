@@ -5,49 +5,59 @@ daa_qlib — 数据源_大A → qlib 数据桥接层
 一行初始化：
 
     import daa_qlib
-    daa_qlib.init("./qlib_data/")
+    daa_qlib.init()
 
 数据流向：
-    数据源_大A (mootdx/腾讯/akshare) → qlib 本地格式 (.bin/.txt) → qlib LocalProvider
+    数据源_大A (mootdx/腾讯) → qlib 本地格式 (.bin/.txt) → qlib LocalProvider
 
 Usage:
     import daa_qlib
-    daa_qlib.init()                    # 默认 ./daa_qlib_data/
-    daa_qlib.init("./my_data/")        # 指定目录
-    daa_qlib.update("./qlib_data/")    # 增量更新
+    daa_qlib.init()           # 默认 C:/qlib_data/
+    daa_qlib.init(stock_count=200)  # 下载前200只
+    daa_qlib.update()         # 增量更新（只拉缺失的）
 """
 import logging
+import os
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 logger = logging.getLogger(__name__)
 
-# Default to ASCII path to avoid Windows + joblib Unicode issues with Chinese paths
+# ASCII-safe paths to avoid Windows + joblib Unicode issues
 DEFAULT_URI = "C:/qlib_data/"
+JOBLIB_TEMP = "C:/temp_joblib/"
 _CURRENT_URI = None
 _QLIB_IMPORTED = False
 
 
-def _ensure_qlib_path():
-    """Ensure qlib is importable — qlib submodule has nested qlib/qlib/ structure.
+def _fix_windows_encoding():
+    """Fix joblib UnicodeEncodeError on Windows with Chinese usernames/paths.
 
-    The qlib git submodule root (outer dir) has no __init__.py.
-    When added to sys.path, `import qlib` finds the inner qlib/qlib/ package.
+    joblib's memmapping pool tries to encode temp paths as ASCII, which breaks
+    when the user home directory has CJK characters. Redirect to ASCII path.
+    Also fix for any subprocess-based parallelism.
     """
-    import sys
-    from pathlib import Path
+    if os.name == "nt" and "JOBLIB_TEMP_FOLDER" not in os.environ:
+        os.makedirs(JOBLIB_TEMP, exist_ok=True)
+        os.environ["JOBLIB_TEMP_FOLDER"] = JOBLIB_TEMP
+        os.environ["JOBLIB_MULTIPROCESSING"] = "0"  # prefer threading
+
+
+def _ensure_qlib_path():
+    """Ensure qlib is importable — submodule has nested qlib/qlib/ structure."""
     outer_qlib = Path(__file__).parent.parent / "qlib"
     if outer_qlib.is_dir() and str(outer_qlib) not in sys.path:
         sys.path.insert(0, str(outer_qlib))
 
 
 def _import_qlib():
-    """Import qlib module with proper path configuration."""
+    """Import qlib with proper path setup and encoding fix."""
     global _QLIB_IMPORTED
     if not _QLIB_IMPORTED:
+        _fix_windows_encoding()
         _ensure_qlib_path()
-        # Clear any cached namespace imports
-        import sys
         for m in list(sys.modules):
             if m.startswith("qlib"):
                 del sys.modules[m]
@@ -57,7 +67,7 @@ def _import_qlib():
 
 
 def _ensure_deps():
-    """Verify all required packages are installed."""
+    """Verify required packages are installed."""
     missing = []
     for pkg in ["mootdx", "pandas", "numpy"]:
         try:
@@ -71,6 +81,32 @@ def _ensure_deps():
         )
 
 
+def _write_instruments_for_downloaded(provider_uri: str) -> int:
+    """Rewrite instruments/all.txt to include ONLY stocks with data on disk.
+
+    This shrinks the instrument list from ~5800 potential codes to only the
+    stocks that actually have downloaded features, dramatically speeding up
+    qlib's D.features() queries (which iterate the full instrument list).
+
+    Returns count of stocks written.
+    """
+    feat_root = Path(provider_uri) / "features"
+    if not feat_root.is_dir():
+        return 0
+    codes = sorted(
+        d.name for d in feat_root.iterdir()
+        if d.is_dir() and (d / "close.day.bin").exists()
+    )
+    if not codes:
+        return 0
+    inst_dir = Path(provider_uri) / "instruments"
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    today = pd.Timestamp.now().strftime("%Y-%m-%d")
+    lines = [f"{c}\t1990-01-01\t{today}" for c in codes]
+    (inst_dir / "all.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return len(codes)
+
+
 def init(
     provider_uri: str = DEFAULT_URI,
     freq: str = "day",
@@ -82,20 +118,21 @@ def init(
     """初始化 daa_qlib — 下载数据 + 注册 qlib provider。
 
     Args:
-        provider_uri: 数据缓存目录（qlib 数据根目录）
+        provider_uri: 数据缓存目录 (默认 C:/qlib_data/，ASCII 路径避免编码问题)
         freq: K线频率 ("day", "1min", "5min" 等)
-        stock_count: 下载股票数量（None=全市场, 指定数字=前N只）
-        ohlcv_only: True=仅行情, False=含估值(PE/PB等)
-        batch_delay: 股票间延迟秒数，防被封
-        auto_register: 是否自动调用 qlib.init() 注册
+        stock_count: 下载股票数量 (None=全市场 ~5800只, 指定数字=前N只)
+        ohlcv_only: 仅行情 OHLCV (True), 含估值 PE/PB (False)
+        batch_delay: 股票间延迟秒数（mootdx TCP 防限流）
+        auto_register: 是否自动调用 qlib.init()
 
     Returns:
-        dict with keys: provider_uri, instrument_count, feature_status, qlib_registered
+        dict: provider_uri, instrument_count, feature_status, qlib_registered
     """
+    _fix_windows_encoding()
     _ensure_deps()
 
     from .calendar_fetcher import fetch_trading_calendar, write_calendar_files
-    from .instrument_fetcher import generate_a_stock_list, write_instrument_files
+    from .instrument_fetcher import generate_a_stock_list
     from .feature_fetcher import download_all_features
 
     global _CURRENT_URI
@@ -103,20 +140,19 @@ def init(
 
     logger.info(f"=== daa_qlib init: provider_uri={provider_uri} ===")
 
-    # Step 1: Calendar (via mootdx K-line dates, no HTTP needed)
-    logger.info("Step 1/3: Deriving trading calendar from mootdx...")
+    # Step 1: Calendar from mootdx (TCP, no HTTP dependency)
+    logger.info("Step 1/3: Trading calendar from mootdx K-line dates...")
     cal = fetch_trading_calendar(provider_uri)
     write_calendar_files(provider_uri, cal)
 
-    # Step 2: Instruments (from static A-share ranges)
-    logger.info("Step 2/3: Generating stock list...")
+    # Step 2: Generate instrument list
+    logger.info("Step 2/3: Stock list...")
     stock_df = generate_a_stock_list()
     if stock_count is not None and stock_count > 0:
         stock_df = stock_df.head(stock_count)
-    write_instrument_files(provider_uri, stock_df)
-
-    # Step 3: Features
     codes = stock_df["code"].tolist()
+
+    # Step 3: Download features → mootdx OHLCV + optional tencent PE/PB
     logger.info(f"Step 3/3: Downloading features for {len(codes)} stocks...")
     feat_summary = download_all_features(
         provider_uri=provider_uri,
@@ -127,9 +163,13 @@ def init(
         batch_delay=batch_delay,
     )
 
+    # Step 3.5: Write instrument file with only downloaded stocks
+    written = _write_instruments_for_downloaded(provider_uri)
+    logger.info(f"Instrument file: {written} stocks with data on disk")
+
     result = {
         "provider_uri": provider_uri,
-        "instrument_count": len(codes),
+        "instrument_count": written,
         "calendar_start": cal[0].strftime("%Y-%m-%d"),
         "calendar_end": cal[-1].strftime("%Y-%m-%d"),
         "feature_status": feat_summary,
@@ -146,15 +186,13 @@ def init(
                 freq=freq,
             )
             result["qlib_registered"] = True
-            logger.info("qlib.init() succeeded")
             from qlib.data import D
-            logger.info(f"  D instruments: {len(D.instruments(market='all'))} stocks")
-            logger.info(f"  D calendar: {D.calendar()[0]} ~ {D.calendar()[-1]}")
+            logger.info(f"qlib ready — {len(D.instruments(market='all'))} stocks, "
+                        f"calendar {D.calendar()[0]} ~ {D.calendar()[-1]}")
         except Exception as e:
             logger.warning(f"qlib.init() failed: {e}")
-            logger.warning(f"You can manually run: qlib.init(provider_uri='{provider_uri}')")
 
-    logger.info("=== daa_qlib init complete ===")
+    logger.info(f"=== done: {written} stocks, {len(cal)} trading days ===")
     return result
 
 
@@ -164,24 +202,21 @@ def update(
     ohlcv_only: bool = False,
     batch_delay: float = 0.3,
 ) -> dict:
-    """增量更新 — 只下载新增的股票和缺失的数据。
+    """增量更新 — 刷新日历 + 下载新增/缺失股票的数据。
 
-    Args:
-        provider_uri: 数据目录（默认用上次 init 的目录）
-        freq: K线频率
-        ohlcv_only: 仅行情
-        batch_delay: 请求间隔
+    已有数据的股票直接跳过，全缓存命中时秒级完成。
 
     Returns:
-        dict: updated_count, new_stocks, etc.
+        dict: updated_count, total_stocks
     """
     if provider_uri is None:
         provider_uri = _CURRENT_URI or DEFAULT_URI
 
+    _fix_windows_encoding()
     _ensure_deps()
 
     from .calendar_fetcher import fetch_trading_calendar, write_calendar_files
-    from .instrument_fetcher import generate_a_stock_list, write_instrument_files
+    from .instrument_fetcher import generate_a_stock_list
     from .feature_fetcher import download_stock_features, _calendar_index_map
 
     # Refresh calendar
@@ -189,15 +224,13 @@ def update(
     write_calendar_files(provider_uri, cal)
     cal_map = _calendar_index_map(cal)
 
-    # Refresh instruments
+    # Check all codes for missing features
     stock_df = generate_a_stock_list()
-    write_instrument_files(provider_uri, stock_df)
     codes = stock_df["code"].tolist()
 
-    # Only download missing features
     import time
     updated = 0
-    for i, code in enumerate(codes):
+    for code in codes:
         feat_dir = Path(provider_uri) / "features" / code
         if (feat_dir / f"close.{freq}.bin").exists():
             continue
@@ -205,13 +238,62 @@ def update(
             download_stock_features(code, cal_map, provider_uri, freq, ohlcv_only)
             updated += 1
             if updated % 20 == 0:
-                logger.info(f"Updated {updated} new stocks...")
+                logger.info(f"  {updated} new stocks downloaded...")
         except Exception as e:
-            logger.warning(f"Update failed for {code}: {e}")
+            logger.warning(f"  {code}: {e}")
         time.sleep(batch_delay)
 
-    logger.info(f"Update complete: {updated} new stocks downloaded, {len(codes) - updated} unchanged")
+    if updated > 0:
+        _write_instruments_for_downloaded(provider_uri)
+
+    logger.info(f"Update: {updated} new, {len(codes) - updated} unchanged")
     return {"updated_count": updated, "total_stocks": len(codes)}
+
+
+def daily_sync(
+    provider_uri: str = None,
+    ohlcv_only: bool = True,
+) -> dict:
+    """每日盘后快速同步 — 重新拉取日历 + 最近交易日数据。
+
+    只刷新日历和最近几个交易日的增量数据。比 update() 更快。
+
+    Returns:
+        dict: synced_count, calendar_updated
+    """
+    if provider_uri is None:
+        provider_uri = _CURRENT_URI or DEFAULT_URI
+
+    _fix_windows_encoding()
+    _ensure_deps()
+
+    from .calendar_fetcher import fetch_trading_calendar, write_calendar_files
+    from .feature_fetcher import download_stock_features, _calendar_index_map
+
+    # Refresh calendar
+    cal = fetch_trading_calendar(provider_uri)
+    write_calendar_files(provider_uri, cal)
+    cal_map = _calendar_index_map(cal)
+
+    # Only refresh stocks that already have data (skip new/unlisted codes)
+    feat_root = Path(provider_uri) / "features"
+    codes = sorted(
+        d.name for d in feat_root.iterdir()
+        if d.is_dir() and (d / "close.day.bin").exists()
+    )
+
+    import time
+    synced = 0
+    for code in codes:
+        try:
+            download_stock_features(code, cal_map, provider_uri, "day", ohlcv_only)
+            synced += 1
+        except Exception:
+            pass
+        time.sleep(0.05)  # light delay; same-day data is cached by mootdx
+
+    logger.info(f"Daily sync: {synced}/{len(codes)} stocks refreshed")
+    return {"synced_count": synced, "calendar_updated": True}
 
 
 def is_initialized() -> bool:
