@@ -4,8 +4,8 @@
 从单因子报告中选取优质因子，生成 1000+ 带经济逻辑解释的因子组合，
 评估各组合的 RankIC、Top-Bottom 收益，输出最优组合报告。
 
-输入: C:/因子数据/all_factors.parquet, C:/因子数据/single_factor_report.csv
-输出: C:/因子数据/best_combinations.csv, C:/因子数据/combination_report.md
+输入: C:/factor_data/all_factors.parquet, C:/factor_data/single_factor_report.csv
+输出: C:/factor_data/best_combinations.csv, C:/factor_data/combination_report.md
 """
 
 import os
@@ -19,7 +19,7 @@ from scipy.stats import rankdata
 warnings.filterwarnings("ignore")
 
 # ── 路径配置
-DATA_DIR  = "C:/因子数据"
+DATA_DIR  = "C:/factor_data"
 OUTPUT_PQ = os.path.join(DATA_DIR, "all_factors.parquet")
 INPUT_CSV = os.path.join(DATA_DIR, "single_factor_report.csv")
 OUTPUT_CSV= os.path.join(DATA_DIR, "best_combinations.csv")
